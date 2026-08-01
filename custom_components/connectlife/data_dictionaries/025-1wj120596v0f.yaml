@@ -3,7 +3,9 @@ properties:
 - property: Selected_program_ID
   select:
     options:
-        5: allergy_care
+        1: cotton_dry
+        2: synthetic_dry
+        4: refresh        
         6: drum_clean
         7: cotton
         8: synthetic
@@ -11,13 +13,15 @@ properties:
         10: wool
         11: quick_15
         14: spin
+        15: allergy_care
         16: baby_care
-        18: sportswear
-        19: down
         20: rinse_spin
-        24: shirts
-        41: power_49
+        22: wash_dry_49
         42: auto
+        44: bedding
+        52: power_30
+        56: pets        
+        57: full_load_49
 - property: Current_program_phase
   sensor:
     device_class: enum
