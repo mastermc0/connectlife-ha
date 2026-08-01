@@ -38,6 +38,7 @@ properties:
     read_only: true
     device_class: enum
     options:
-      1: "not_granted"
-      2: "no_remote_start"
-      3: "granted      
+      0: "disabled"
+      1: "enabled"
+      2: "not_granted"
+      3: "granted"      
