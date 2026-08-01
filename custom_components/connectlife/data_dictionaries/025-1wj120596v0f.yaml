@@ -39,4 +39,5 @@ properties:
     device_class: enum
     options:
       1: "not_granted"
+      2: "no_remote_start"
       3: "granted      
