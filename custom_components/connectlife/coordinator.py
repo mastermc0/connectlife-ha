@@ -26,7 +26,7 @@ from homeassistant.util import dt as dt_util
 from .const import DATA_STATE_CLASS_MIGRATION_DONE, DOMAIN
 from .dictionaries import Dictionaries
 from .messages import format_retry_message
-from .statistics_sources import STATISTICS_SOURCES, enabled_sensors
+from .statistics_sources import STATISTICS_SOURCES, StatisticsSensorDef, enabled_sensors
 
 MAX_RETRIES = 3
 STATISTICS_UPDATE_INTERVAL = timedelta(minutes=10)
@@ -320,9 +320,8 @@ class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyRes
         for device_id, appliance in self.appliance_coordinator.data.items():
             dictionary = Dictionaries.get_dictionary(appliance)
             source = STATISTICS_SOURCES.get(dictionary.statistics_source or "")
-            if source is None or not enabled_sensors(
-                dictionary.statistics_source, dictionary.statistics_sensors
-            ):
+            sensors = enabled_sensors(dictionary.statistics_source, dictionary.statistics_sensors)
+            if source is None or not sensors:
                 continue
             try:
                 fetched = await source.fetch(self.api, appliance)
@@ -341,7 +340,7 @@ class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyRes
                 if self._accepted.pop(device_id, None) is not None:
                     self._accepted_dirty = True
                 continue
-            result[device_id] = self._accept_or_reuse(device_id, appliance, today, fetched)
+            result[device_id] = self._accept_or_reuse(device_id, appliance, today, fetched, sensors)
         if self._accepted_dirty:
             await self._async_save_accepted()
             self._accepted_dirty = False
@@ -353,6 +352,7 @@ class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyRes
         appliance: ConnectLifeAppliance,
         today: date,
         fetched: EnergyResult | None,
+        sensors: list[StatisticsSensorDef],
     ) -> EnergyResult | None:
         """Decide whether to accept a freshly fetched result or keep serving the last one."""
         if fetched is None:
@@ -362,17 +362,23 @@ class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyRes
 
         status_snapshot = _status_snapshot(appliance)
         accepted = self._accepted.get(device_id)
-        if (
-            accepted is not None
-            and accepted.day == today
-            and accepted.status_snapshot == status_snapshot
-        ):
-            _LOGGER.debug(
-                "Suppressing statistics update for %s: no device status change since last "
-                "accepted reading (see issue #669)",
-                appliance.device_nickname,
-            )
-            return accepted.result
+        if accepted is not None and accepted.day == today:
+            if accepted.status_snapshot == status_snapshot:
+                _LOGGER.debug(
+                    "Suppressing statistics update for %s: no device status change since last "
+                    "accepted reading (see issue #669)",
+                    appliance.device_nickname,
+                )
+                return accepted.result
+
+            if _is_regression(sensors, accepted.result, fetched):
+                _LOGGER.debug(
+                    "Suppressing statistics update for %s: freshly fetched reading is lower "
+                    "than the already-accepted value for today, which the cloud endpoint "
+                    "should never report (see issue #669)",
+                    appliance.device_nickname,
+                )
+                return accepted.result
 
         self._accepted[device_id] = _AcceptedStatistics(today, status_snapshot, fetched)
         self._accepted_dirty = True
@@ -387,6 +393,24 @@ def _status_snapshot(appliance: ConnectLifeAppliance) -> dict[str, str]:
     representation is used for live comparisons and for persisted state.
     """
     return {k: str(v) for k, v in appliance.status_list.items()}
+
+
+def _is_regression(
+    sensors: list[StatisticsSensorDef], previous: EnergyResult, fetched: EnergyResult
+) -> bool:
+    """Whether any sensor's value went down in ``fetched`` versus ``previous``.
+
+    A same-day "daily total" should never decrease. The cloud endpoint has been
+    observed doing so anyway (see issue #669); this rejects such a reading even
+    when the appliance's own status did change, since a status change alone
+    doesn't make an otherwise-implausible cloud value trustworthy.
+    """
+    for sensor in sensors:
+        old_value = sensor.value(previous)
+        new_value = sensor.value(fetched)
+        if old_value is not None and new_value is not None and new_value < old_value:
+            return True
+    return False
 
 
 def _serialize_accepted(accepted: _AcceptedStatistics) -> dict[str, Any]:

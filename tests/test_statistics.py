@@ -255,12 +255,17 @@ def _consumption_result(today_kwh: str) -> EnergyResult:
     )
 
 
+# The sensor defs _accept_or_reuse needs to check same-day regressions; matches what
+# enabled_sensors("energy_consumption_curve", ...) returns for the _WM dictionary.
+_WM_SENSORS = list(ConsumptionStatisticsSource().sensors)
+
+
 def test_accept_or_reuse_first_reading_is_accepted():
     coord = _coordinator(_FakeApi(), {})
     appliance = _appliance("wm", *_WM, status_list={"machine_status": 1})
     today = dt_util.now().date()
 
-    accepted = coord._accept_or_reuse("wm", appliance, today, _consumption_result("1.0"))
+    accepted = coord._accept_or_reuse("wm", appliance, today, _consumption_result("1.0"), _WM_SENSORS)
 
     assert accepted is not None
     assert _curve_today(accepted.electric_curve) == 1.0
@@ -271,10 +276,10 @@ def test_accept_or_reuse_suppresses_replay_when_status_unchanged():
     appliance = _appliance("wm", *_WM, status_list={"machine_status": 1})  # idle/standby
     today = dt_util.now().date()
 
-    first = coord._accept_or_reuse("wm", appliance, today, _consumption_result("26.0"))
+    first = coord._accept_or_reuse("wm", appliance, today, _consumption_result("26.0"), _WM_SENSORS)
     # Cloud replays the same completed cycle an hour later; nothing on the
     # device itself changed.
-    second = coord._accept_or_reuse("wm", appliance, today, _consumption_result("28.0"))
+    second = coord._accept_or_reuse("wm", appliance, today, _consumption_result("28.0"), _WM_SENSORS)
 
     assert first is not None
     assert _curve_today(first.electric_curve) == 26.0
@@ -289,8 +294,8 @@ def test_accept_or_reuse_accepts_when_status_changes():
     idle = _appliance("wm", *_WM, status_list={"machine_status": 1})
     running = _appliance("wm", *_WM, status_list={"machine_status": 2})  # a new cycle starts
 
-    coord._accept_or_reuse("wm", idle, today, _consumption_result("26.0"))
-    accepted = coord._accept_or_reuse("wm", running, today, _consumption_result("28.0"))
+    coord._accept_or_reuse("wm", idle, today, _consumption_result("26.0"), _WM_SENSORS)
+    accepted = coord._accept_or_reuse("wm", running, today, _consumption_result("28.0"), _WM_SENSORS)
 
     assert accepted is not None
     assert _curve_today(accepted.electric_curve) == 28.0
@@ -302,8 +307,8 @@ def test_accept_or_reuse_accepts_on_new_day_even_if_status_unchanged():
     day1 = date(2024, 1, 1)
     day2 = date(2024, 1, 2)
 
-    coord._accept_or_reuse("wm", appliance, day1, _consumption_result("26.0"))
-    accepted = coord._accept_or_reuse("wm", appliance, day2, _consumption_result("0.5"))
+    coord._accept_or_reuse("wm", appliance, day1, _consumption_result("26.0"), _WM_SENSORS)
+    accepted = coord._accept_or_reuse("wm", appliance, day2, _consumption_result("0.5"), _WM_SENSORS)
 
     assert accepted is not None
     assert _curve_today(accepted.electric_curve) == 0.5
@@ -314,15 +319,76 @@ def test_accept_or_reuse_clears_state_when_fetch_returns_none():
     appliance = _appliance("wm", *_WM, status_list={"machine_status": 1})
     today = dt_util.now().date()
 
-    coord._accept_or_reuse("wm", appliance, today, _consumption_result("26.0"))
-    result = coord._accept_or_reuse("wm", appliance, today, None)
+    coord._accept_or_reuse("wm", appliance, today, _consumption_result("26.0"), _WM_SENSORS)
+    result = coord._accept_or_reuse("wm", appliance, today, None, _WM_SENSORS)
     assert result is None
 
     # A later successful fetch with unchanged status is treated as a fresh
     # baseline, not compared against the pre-None accepted value.
-    accepted = coord._accept_or_reuse("wm", appliance, today, _consumption_result("99.0"))
+    accepted = coord._accept_or_reuse("wm", appliance, today, _consumption_result("99.0"), _WM_SENSORS)
     assert accepted is not None
     assert _curve_today(accepted.electric_curve) == 99.0
+
+
+# -- issue #669 follow-up: same-day regressions are also rejected -----------
+#
+# A drop in the cloud's "today" figure was observed after a status change
+# (running -> finished) — not just a same-value replay. Any status change is
+# enough to make _accept_or_reuse re-trust the cloud, so a same-day decrease
+# needs its own check independent of the status comparison.
+
+
+def test_accept_or_reuse_rejects_same_day_regression_even_with_status_change():
+    coord = _coordinator(_FakeApi(), {})
+    today = dt_util.now().date()
+    running = _appliance("wm", *_WM, status_list={"machine_status": 2})
+    finished = _appliance("wm", *_WM, status_list={"machine_status": 1})
+
+    coord._accept_or_reuse("wm", running, today, _consumption_result("26.31"), _WM_SENSORS)
+    # Status changed (running -> finished), but the cloud reports a lower total
+    # for the same day -- exactly what was observed in issue #669.
+    accepted = coord._accept_or_reuse(
+        "wm", finished, today, _consumption_result("26.13"), _WM_SENSORS
+    )
+
+    assert accepted is not None
+    assert _curve_today(accepted.electric_curve) == 26.31  # regression rejected, old value kept
+
+
+def test_accept_or_reuse_accepts_equal_or_higher_value_on_status_change():
+    coord = _coordinator(_FakeApi(), {})
+    today = dt_util.now().date()
+    running = _appliance("wm", *_WM, status_list={"machine_status": 2})
+    finished = _appliance("wm", *_WM, status_list={"machine_status": 1})
+
+    coord._accept_or_reuse("wm", running, today, _consumption_result("26.31"), _WM_SENSORS)
+    accepted = coord._accept_or_reuse(
+        "wm", finished, today, _consumption_result("26.31"), _WM_SENSORS
+    )
+    assert accepted is not None
+    assert _curve_today(accepted.electric_curve) == 26.31  # equal is not a regression
+
+    higher = coord._accept_or_reuse(
+        "wm", running, today, _consumption_result("27.00"), _WM_SENSORS
+    )
+    assert higher is not None
+    assert _curve_today(higher.electric_curve) == 27.00
+
+
+def test_accept_or_reuse_regression_guard_does_not_block_new_day():
+    coord = _coordinator(_FakeApi(), {})
+    appliance = _appliance("wm", *_WM, status_list={"machine_status": 1})
+    day1 = date(2024, 1, 1)
+    day2 = date(2024, 1, 2)
+
+    coord._accept_or_reuse("wm", appliance, day1, _consumption_result("26.31"), _WM_SENSORS)
+    # Lower value, but it's a new day -- this is a legitimate reset, not a regression.
+    accepted = coord._accept_or_reuse(
+        "wm", appliance, day2, _consumption_result("0.10"), _WM_SENSORS
+    )
+
+    assert accepted is not None
+    assert _curve_today(accepted.electric_curve) == 0.10
 
 
 async def test_async_update_data_suppresses_replay_across_polls():
