@@ -1,7 +1,9 @@
 import async_timeout
 import logging
 from collections.abc import Mapping
-from datetime import timedelta
+from dataclasses import dataclass
+from datetime import date, timedelta
+from typing import Any
 
 from connectlife.api import LifeConnectAuthError, LifeConnectError, ConnectLifeApi, EnergyResult
 from connectlife.appliance import ConnectLifeAppliance
@@ -11,6 +13,7 @@ from homeassistant.const import Platform
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import device_registry as dr, entity_registry as er, issue_registry as ir
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
 from .const import DATA_STATE_CLASS_MIGRATION_DONE, DOMAIN
 from .dictionaries import Dictionaries
@@ -209,15 +212,40 @@ class ConnectLifeCoordinator(DataUpdateCoordinator[dict[str, ConnectLifeApplianc
         )
 
 
+@dataclass
+class _AcceptedStatistics:
+    """The last statistics result we chose to expose for a device, and the
+    conditions under which it was accepted."""
+
+    day: date
+    status_snapshot: dict[str, Any]
+    result: EnergyResult
+
+
 class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyResult | None]]):
     """ConnectLife statistics coordinator. Polls each appliance's statistics endpoint
     (selected per device type via the data dictionary ``statistics_source``) every 10
-    minutes. Stores the fetched result per device; sensors extract their datapoint."""
+    minutes. Stores the fetched result per device; sensors extract their datapoint.
+
+    ConnectLife's cloud statistics endpoints are known to occasionally replay a
+    completed cycle's totals into "today" on an hourly cadence, even while the
+    appliance sits idle (see
+    https://github.com/oyvindwe/connectlife-ha/issues/669). Since the client performs
+    no local accumulation, such a replay would otherwise show up directly as a jump
+    in the daily sensor. To mitigate this without a way to tell a genuine reading
+    from a replayed one, a freshly fetched result is only accepted when either the
+    local day has rolled over, or the appliance's own status has changed since the
+    last accepted reading — a proxy for "something actually happened". Otherwise the
+    previously accepted result keeps being served. Legitimate ongoing activity (a
+    running cycle) continuously changes status properties (phase, remaining time,
+    etc.), so this should not suppress real increases.
+    """
 
     def __init__(self, hass, api: ConnectLifeApi, appliance_coordinator: ConnectLifeCoordinator):
         """Initialize statistics coordinator."""
         self.api = api
         self.appliance_coordinator = appliance_coordinator
+        self._accepted: dict[str, _AcceptedStatistics] = {}
         super().__init__(
             hass,
             _LOGGER,
@@ -228,6 +256,7 @@ class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyRes
     async def _async_update_data(self) -> dict[str, EnergyResult | None]:
         """Fetch statistics for appliances whose data dictionary opts into an endpoint."""
         result: dict[str, EnergyResult | None] = {}
+        today = dt_util.now().date()
         for device_id, appliance in self.appliance_coordinator.data.items():
             dictionary = Dictionaries.get_dictionary(appliance)
             source = STATISTICS_SOURCES.get(dictionary.statistics_source or "")
@@ -236,7 +265,7 @@ class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyRes
             ):
                 continue
             try:
-                result[device_id] = await source.fetch(self.api, appliance)
+                fetched = await source.fetch(self.api, appliance)
             except LifeConnectAuthError:
                 # Token is rejected; stop rather than hammering the gateway (and any
                 # re-login) for every remaining device. Recovers on the next cycle.
@@ -249,4 +278,36 @@ class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyRes
                     exc_info=True,
                 )
                 result[device_id] = None
+                self._accepted.pop(device_id, None)
+                continue
+            result[device_id] = self._accept_or_reuse(device_id, appliance, today, fetched)
         return result
+
+    def _accept_or_reuse(
+        self,
+        device_id: str,
+        appliance: ConnectLifeAppliance,
+        today: date,
+        fetched: EnergyResult | None,
+    ) -> EnergyResult | None:
+        """Decide whether to accept a freshly fetched result or keep serving the last one."""
+        if fetched is None:
+            self._accepted.pop(device_id, None)
+            return None
+
+        status_snapshot = dict(appliance.status_list)
+        accepted = self._accepted.get(device_id)
+        if (
+            accepted is not None
+            and accepted.day == today
+            and accepted.status_snapshot == status_snapshot
+        ):
+            _LOGGER.debug(
+                "Suppressing statistics update for %s: no device status change since last "
+                "accepted reading (see issue #669)",
+                appliance.device_nickname,
+            )
+            return accepted.result
+
+        self._accepted[device_id] = _AcceptedStatistics(today, status_snapshot, fetched)
+        return fetched

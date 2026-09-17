@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import date
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
-from connectlife.api import LifeConnectAuthError
+from connectlife.api import EnergyResult, LifeConnectAuthError
+from connectlife.appliance import ConnectLifeAppliance
 from homeassistant.util import dt as dt_util
 
 from custom_components.connectlife.coordinator import ConnectLifeStatisticsCoordinator
@@ -103,13 +106,19 @@ class _FakeApi:
         return self._consumption
 
 
-def _appliance(device_id: str, type_code: str, feature: str):
-    return SimpleNamespace(
-        device_id=device_id,
-        device_type_code=type_code,
-        device_feature_code=feature,
-        puid=f"puid{device_id}",
-        device_nickname=f"dev-{device_id}",
+def _appliance(
+    device_id: str, type_code: str, feature: str, status_list: dict | None = None
+) -> ConnectLifeAppliance:
+    return cast(
+        ConnectLifeAppliance,
+        SimpleNamespace(
+            device_id=device_id,
+            device_type_code=type_code,
+            device_feature_code=feature,
+            puid=f"puid{device_id}",
+            device_nickname=f"dev-{device_id}",
+            status_list=status_list if status_list is not None else {},
+        ),
     )
 
 
@@ -119,6 +128,7 @@ def _coordinator(api, data: dict):
     coord = ConnectLifeStatisticsCoordinator.__new__(ConnectLifeStatisticsCoordinator)
     coord.api = api  # type: ignore[assignment]
     coord.appliance_coordinator = SimpleNamespace(data=data)  # type: ignore[assignment]
+    coord._accepted = {}  # type: ignore[attr-defined]
     return coord
 
 
@@ -204,6 +214,108 @@ async def test_coordinator_skips_device_without_statistics_source():
     assert result == {}
     assert api.air_duct_calls == 0
     assert api.consumption_calls == 0
+
+
+# -- issue #669: suppress cloud replay of a completed cycle -----------------
+#
+# ConnectLife's statistics endpoints have been observed to replay a completed
+# cycle's totals into "today" on an hourly cadence while the appliance sits
+# idle. Since the client does no local accumulation, this would otherwise
+# surface directly as a jump in the daily sensor. The coordinator mitigates
+# this by only accepting a freshly fetched result when the day has rolled
+# over or the appliance's status_list has changed since the last accepted
+# reading (a proxy for "something actually happened").
+
+
+def _consumption_result(today_kwh: str) -> EnergyResult:
+    return cast(
+        EnergyResult, SimpleNamespace(electric_curve={_today_key(): today_kwh}, water_curve={})
+    )
+
+
+def test_accept_or_reuse_first_reading_is_accepted():
+    coord = _coordinator(_FakeApi(), {})
+    appliance = _appliance("wm", *_WM, status_list={"machine_status": 1})
+    today = dt_util.now().date()
+
+    accepted = coord._accept_or_reuse("wm", appliance, today, _consumption_result("1.0"))
+
+    assert accepted is not None
+    assert _curve_today(accepted.electric_curve) == 1.0
+
+
+def test_accept_or_reuse_suppresses_replay_when_status_unchanged():
+    coord = _coordinator(_FakeApi(), {})
+    appliance = _appliance("wm", *_WM, status_list={"machine_status": 1})  # idle/standby
+    today = dt_util.now().date()
+
+    first = coord._accept_or_reuse("wm", appliance, today, _consumption_result("26.0"))
+    # Cloud replays the same completed cycle an hour later; nothing on the
+    # device itself changed.
+    second = coord._accept_or_reuse("wm", appliance, today, _consumption_result("28.0"))
+
+    assert first is not None
+    assert _curve_today(first.electric_curve) == 26.0
+    assert second is first  # frozen: the replayed 28.0 is not surfaced
+    assert second is not None
+    assert _curve_today(second.electric_curve) == 26.0
+
+
+def test_accept_or_reuse_accepts_when_status_changes():
+    coord = _coordinator(_FakeApi(), {})
+    today = dt_util.now().date()
+    idle = _appliance("wm", *_WM, status_list={"machine_status": 1})
+    running = _appliance("wm", *_WM, status_list={"machine_status": 2})  # a new cycle starts
+
+    coord._accept_or_reuse("wm", idle, today, _consumption_result("26.0"))
+    accepted = coord._accept_or_reuse("wm", running, today, _consumption_result("28.0"))
+
+    assert accepted is not None
+    assert _curve_today(accepted.electric_curve) == 28.0
+
+
+def test_accept_or_reuse_accepts_on_new_day_even_if_status_unchanged():
+    coord = _coordinator(_FakeApi(), {})
+    appliance = _appliance("wm", *_WM, status_list={"machine_status": 1})
+    day1 = date(2024, 1, 1)
+    day2 = date(2024, 1, 2)
+
+    coord._accept_or_reuse("wm", appliance, day1, _consumption_result("26.0"))
+    accepted = coord._accept_or_reuse("wm", appliance, day2, _consumption_result("0.5"))
+
+    assert accepted is not None
+    assert _curve_today(accepted.electric_curve) == 0.5
+
+
+def test_accept_or_reuse_clears_state_when_fetch_returns_none():
+    coord = _coordinator(_FakeApi(), {})
+    appliance = _appliance("wm", *_WM, status_list={"machine_status": 1})
+    today = dt_util.now().date()
+
+    coord._accept_or_reuse("wm", appliance, today, _consumption_result("26.0"))
+    result = coord._accept_or_reuse("wm", appliance, today, None)
+    assert result is None
+
+    # A later successful fetch with unchanged status is treated as a fresh
+    # baseline, not compared against the pre-None accepted value.
+    accepted = coord._accept_or_reuse("wm", appliance, today, _consumption_result("99.0"))
+    assert accepted is not None
+    assert _curve_today(accepted.electric_curve) == 99.0
+
+
+async def test_async_update_data_suppresses_replay_across_polls():
+    api = _FakeApi(consumption=_consumption_result("26.0"))
+    data = {"wm": _appliance("wm", *_WM, status_list={"machine_status": 1})}
+    coord = _coordinator(api, data)
+
+    first = await coord._async_update_data()
+    api._consumption = _consumption_result("28.0")  # replay, device still idle
+    second = await coord._async_update_data()
+
+    assert first["wm"] is not None
+    assert _curve_today(first["wm"].electric_curve) == 26.0
+    assert second["wm"] is not None
+    assert _curve_today(second["wm"].electric_curve) == 26.0
 
 
 # -- sensor ----------------------------------------------------------------
