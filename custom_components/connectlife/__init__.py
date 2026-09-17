@@ -84,7 +84,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if (d := Dictionaries.get_dictionary(appliance))
     )
     if has_statistics:
-        statistics_coordinator = ConnectLifeStatisticsCoordinator(hass, api, coordinator)
+        statistics_coordinator = ConnectLifeStatisticsCoordinator(
+            hass, api, coordinator, entry.entry_id
+        )
         await statistics_coordinator.async_config_entry_first_refresh()
         hass.data[DOMAIN][f"{entry.entry_id}_statistics"] = statistics_coordinator
 

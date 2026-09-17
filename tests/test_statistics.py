@@ -7,11 +7,17 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
-from connectlife.api import EnergyResult, LifeConnectAuthError
+from connectlife.api import AirDuctEnergy, EnergyConsumption, EnergyResult, LifeConnectAuthError
 from connectlife.appliance import ConnectLifeAppliance
 from homeassistant.util import dt as dt_util
 
-from custom_components.connectlife.coordinator import ConnectLifeStatisticsCoordinator
+from custom_components.connectlife.coordinator import (
+    ConnectLifeStatisticsCoordinator,
+    _AcceptedStatistics,
+    _deserialize_accepted,
+    _serialize_accepted,
+    _status_snapshot,
+)
 from custom_components.connectlife.dictionaries import Dictionaries, Dictionary
 from custom_components.connectlife.sensor import ConnectLifeStatisticsSensor
 from custom_components.connectlife.statistics_sources import (
@@ -122,13 +128,29 @@ def _appliance(
     )
 
 
-def _coordinator(api, data: dict):
+class _FakeStore:
+    """Records saved payloads; ``preload`` seeds what ``async_load`` returns once."""
+
+    def __init__(self, preload: dict | None = None):
+        self.preload = preload
+        self.saved: list[dict] = []
+
+    async def async_load(self):
+        return self.preload
+
+    async def async_save(self, data):
+        self.saved.append(data)
+
+
+def _coordinator(api, data: dict, store: "_FakeStore | None" = None):
     # Bypass DataUpdateCoordinator.__init__ (needs hass); the fetch loop only uses
     # self.api and self.appliance_coordinator.data.
     coord = ConnectLifeStatisticsCoordinator.__new__(ConnectLifeStatisticsCoordinator)
     coord.api = api  # type: ignore[assignment]
     coord.appliance_coordinator = SimpleNamespace(data=data)  # type: ignore[assignment]
     coord._accepted = {}  # type: ignore[attr-defined]
+    coord._accepted_dirty = False  # type: ignore[attr-defined]
+    coord._store = store if store is not None else _FakeStore()  # type: ignore[assignment]
     return coord
 
 
@@ -316,6 +338,95 @@ async def test_async_update_data_suppresses_replay_across_polls():
     assert _curve_today(first["wm"].electric_curve) == 26.0
     assert second["wm"] is not None
     assert _curve_today(second["wm"].electric_curve) == 26.0
+
+
+# -- persistence across restarts --------------------------------------------
+#
+# self._accepted only lives in memory, so a Home Assistant restart would
+# otherwise leave the coordinator with no baseline: the first poll after every
+# restart would blindly accept whatever the cloud currently reports, replay or
+# not. Persisting accepted readings (and restoring them in _async_setup) closes
+# that gap.
+
+
+def _real_consumption_result(today_kwh: str) -> EnergyConsumption:
+    return EnergyConsumption(
+        stat_type="week",
+        date_start="2024-01-01",
+        date_end="2024-01-07",
+        electric_total=None,
+        electric_curve={_today_key(): today_kwh},
+        raw={},
+        water_total=None,
+        run_time=None,
+        cycles=None,
+        norm_electric_total=None,
+        norm_water_total=None,
+        water_curve={},
+        energy_period=None,
+    )
+
+
+def test_status_snapshot_stringifies_values():
+    appliance = _appliance("wm", *_WM, status_list={"machine_status": 1, "door": "closed"})
+    assert _status_snapshot(appliance) == {"machine_status": "1", "door": "closed"}
+
+
+def test_serialize_deserialize_accepted_round_trips():
+    accepted = _AcceptedStatistics(
+        day=date(2024, 1, 1),
+        status_snapshot={"machine_status": "1"},
+        result=_real_consumption_result("26.0"),
+    )
+
+    restored = _deserialize_accepted(_serialize_accepted(accepted))
+
+    assert restored is not None
+    assert restored.day == accepted.day
+    assert restored.status_snapshot == accepted.status_snapshot
+    assert restored.result == accepted.result
+
+
+def test_deserialize_accepted_discards_malformed_entries():
+    assert _deserialize_accepted({}) is None
+    assert _deserialize_accepted({"result_type": "not_a_real_type"}) is None
+    assert _deserialize_accepted({"day": "not-a-date", "result_type": "EnergyConsumption"}) is None
+
+
+async def test_async_setup_restores_accepted_state_and_suppresses_replay():
+    accepted = _AcceptedStatistics(
+        day=dt_util.now().date(),
+        status_snapshot=_status_snapshot(_appliance("wm", *_WM, status_list={"machine_status": 1})),
+        result=_real_consumption_result("26.0"),
+    )
+    store = _FakeStore(preload={"devices": {"wm": _serialize_accepted(accepted)}})
+    api = _FakeApi(consumption=_real_consumption_result("28.0"))  # replay, on the "first" poll
+    data = {"wm": _appliance("wm", *_WM, status_list={"machine_status": 1})}
+    coord = _coordinator(api, data, store=store)
+
+    await coord._async_setup()
+    result = await coord._async_update_data()
+
+    # Restored baseline means even the very first poll this run suppresses the replay.
+    assert result["wm"] is not None
+    assert _curve_today(result["wm"].electric_curve) == 26.0
+
+
+async def test_async_update_data_persists_only_when_accepted_state_changes():
+    store = _FakeStore()
+    api = _FakeApi(consumption=_real_consumption_result("26.0"))
+    data = {"wm": _appliance("wm", *_WM, status_list={"machine_status": 1})}
+    coord = _coordinator(api, data, store=store)
+
+    await coord._async_update_data()  # first reading: new baseline -> persists
+    assert len(store.saved) == 1
+
+    await coord._async_update_data()  # same status, replayed value -> suppressed, no I/O
+    assert len(store.saved) == 1
+
+    data["wm"] = _appliance("wm", *_WM, status_list={"machine_status": 2})  # real change
+    await coord._async_update_data()
+    assert len(store.saved) == 2
 
 
 # -- sensor ----------------------------------------------------------------
