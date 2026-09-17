@@ -1,17 +1,25 @@
 import async_timeout
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, timedelta
 from typing import Any
 
-from connectlife.api import LifeConnectAuthError, LifeConnectError, ConnectLifeApi, EnergyResult
+from connectlife.api import (
+    AirDuctEnergy,
+    ConnectLifeApi,
+    EnergyConsumption,
+    EnergyResult,
+    LifeConnectAuthError,
+    LifeConnectError,
+)
 from connectlife.appliance import ConnectLifeAppliance
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.statistics import list_statistic_ids
 from homeassistant.const import Platform
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import device_registry as dr, entity_registry as er, issue_registry as ir
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
@@ -22,6 +30,12 @@ from .statistics_sources import STATISTICS_SOURCES, enabled_sensors
 
 MAX_RETRIES = 3
 STATISTICS_UPDATE_INTERVAL = timedelta(minutes=10)
+STATISTICS_ACCEPTED_STORAGE_VERSION = 1
+
+# EnergyResult subclasses, keyed by class name, for restoring persisted statistics.
+_ENERGY_RESULT_TYPES: dict[str, type[EnergyResult]] = {
+    cls.__name__: cls for cls in (AirDuctEnergy, EnergyConsumption)
+}
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -239,19 +253,65 @@ class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyRes
     previously accepted result keeps being served. Legitimate ongoing activity (a
     running cycle) continuously changes status properties (phase, remaining time,
     etc.), so this should not suppress real increases.
+
+    The accepted-reading state is persisted (see ``_async_setup``/``_async_save_accepted``)
+    so a Home Assistant restart doesn't lose it — otherwise the first poll after every
+    restart would have no baseline to compare against and would blindly accept whatever
+    the cloud happens to be reporting at that moment, replay-inflated or not.
     """
 
-    def __init__(self, hass, api: ConnectLifeApi, appliance_coordinator: ConnectLifeCoordinator):
+    def __init__(
+        self,
+        hass,
+        api: ConnectLifeApi,
+        appliance_coordinator: ConnectLifeCoordinator,
+        entry_id: str,
+    ):
         """Initialize statistics coordinator."""
         self.api = api
         self.appliance_coordinator = appliance_coordinator
         self._accepted: dict[str, _AcceptedStatistics] = {}
+        self._accepted_dirty = False
+        self._store: Store[dict[str, Any]] = Store(
+            hass, STATISTICS_ACCEPTED_STORAGE_VERSION, f"{DOMAIN}_{entry_id}_statistics_accepted"
+        )
         super().__init__(
             hass,
             _LOGGER,
             name=f"{DOMAIN}_statistics",
             update_interval=STATISTICS_UPDATE_INTERVAL,
         )
+
+    async def _async_setup(self) -> None:
+        """Restore accepted statistics readings from a previous run, if any."""
+        try:
+            stored = await self._store.async_load()
+        except Exception:
+            _LOGGER.debug("Failed to load persisted statistics state", exc_info=True)
+            return
+        if not stored:
+            return
+        for device_id, entry in stored.get("devices", {}).items():
+            accepted = _deserialize_accepted(entry)
+            if accepted is not None:
+                self._accepted[device_id] = accepted
+
+    async def _async_save_accepted(self) -> None:
+        """Persist the current accepted-reading state."""
+        devices: dict[str, Any] = {}
+        for device_id, accepted in self._accepted.items():
+            try:
+                devices[device_id] = _serialize_accepted(accepted)
+            except TypeError:
+                # accepted.result wasn't a plain dataclass instance; skip persisting
+                # this one device rather than losing the whole save.
+                _LOGGER.debug(
+                    "Could not serialize statistics state for %s", device_id, exc_info=True
+                )
+        try:
+            await self._store.async_save({"devices": devices})
+        except Exception:
+            _LOGGER.debug("Failed to persist statistics state", exc_info=True)
 
     async def _async_update_data(self) -> dict[str, EnergyResult | None]:
         """Fetch statistics for appliances whose data dictionary opts into an endpoint."""
@@ -278,9 +338,13 @@ class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyRes
                     exc_info=True,
                 )
                 result[device_id] = None
-                self._accepted.pop(device_id, None)
+                if self._accepted.pop(device_id, None) is not None:
+                    self._accepted_dirty = True
                 continue
             result[device_id] = self._accept_or_reuse(device_id, appliance, today, fetched)
+        if self._accepted_dirty:
+            await self._async_save_accepted()
+            self._accepted_dirty = False
         return result
 
     def _accept_or_reuse(
@@ -292,10 +356,11 @@ class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyRes
     ) -> EnergyResult | None:
         """Decide whether to accept a freshly fetched result or keep serving the last one."""
         if fetched is None:
-            self._accepted.pop(device_id, None)
+            if self._accepted.pop(device_id, None) is not None:
+                self._accepted_dirty = True
             return None
 
-        status_snapshot = dict(appliance.status_list)
+        status_snapshot = _status_snapshot(appliance)
         accepted = self._accepted.get(device_id)
         if (
             accepted is not None
@@ -310,4 +375,37 @@ class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyRes
             return accepted.result
 
         self._accepted[device_id] = _AcceptedStatistics(today, status_snapshot, fetched)
+        self._accepted_dirty = True
         return fetched
+
+
+def _status_snapshot(appliance: ConnectLifeAppliance) -> dict[str, str]:
+    """A plain-string snapshot of an appliance's status, for equality comparison.
+
+    Stringifying keeps this both a valid equality-comparable snapshot and directly
+    JSON-serializable (``status_list`` values may be ``datetime``), so the same
+    representation is used for live comparisons and for persisted state.
+    """
+    return {k: str(v) for k, v in appliance.status_list.items()}
+
+
+def _serialize_accepted(accepted: _AcceptedStatistics) -> dict[str, Any]:
+    return {
+        "day": accepted.day.isoformat(),
+        "status_snapshot": accepted.status_snapshot,
+        "result_type": type(accepted.result).__name__,
+        "result": asdict(accepted.result),
+    }
+
+
+def _deserialize_accepted(entry: dict[str, Any]) -> _AcceptedStatistics | None:
+    try:
+        result_cls = _ENERGY_RESULT_TYPES[entry["result_type"]]
+        return _AcceptedStatistics(
+            day=date.fromisoformat(entry["day"]),
+            status_snapshot=entry["status_snapshot"],
+            result=result_cls(**entry["result"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        _LOGGER.debug("Discarding malformed persisted statistics entry", exc_info=True)
+        return None
