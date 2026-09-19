@@ -2,22 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import date
 from types import SimpleNamespace
-from typing import cast
 
 import pytest
-from connectlife.api import AirDuctEnergy, EnergyConsumption, EnergyResult, LifeConnectAuthError
-from connectlife.appliance import ConnectLifeAppliance
+from connectlife.api import LifeConnectAuthError
 from homeassistant.util import dt as dt_util
 
-from custom_components.connectlife.coordinator import (
-    ConnectLifeStatisticsCoordinator,
-    _AcceptedStatistics,
-    _deserialize_accepted,
-    _serialize_accepted,
-    _status_snapshot,
-)
+from custom_components.connectlife.coordinator import ConnectLifeStatisticsCoordinator
 from custom_components.connectlife.dictionaries import Dictionaries, Dictionary
 from custom_components.connectlife.sensor import ConnectLifeStatisticsSensor
 from custom_components.connectlife.statistics_sources import (
@@ -112,46 +103,23 @@ class _FakeApi:
         return self._consumption
 
 
-def _appliance(
-    device_id: str, type_code: str, feature: str, status_list: dict | None = None
-) -> ConnectLifeAppliance:
-    return cast(
-        ConnectLifeAppliance,
-        SimpleNamespace(
-            device_id=device_id,
-            device_type_code=type_code,
-            device_feature_code=feature,
-            puid=f"puid{device_id}",
-            device_nickname=f"dev-{device_id}",
-            status_list=status_list if status_list is not None else {},
-        ),
+def _appliance(device_id: str, type_code: str, feature: str):
+    return SimpleNamespace(
+        device_id=device_id,
+        device_type_code=type_code,
+        device_feature_code=feature,
+        puid=f"puid{device_id}",
+        device_nickname=f"dev-{device_id}",
     )
 
 
-class _FakeStore:
-    """Records saved payloads; ``preload`` seeds what ``async_load`` returns once."""
-
-    def __init__(self, preload: dict | None = None):
-        self.preload = preload
-        self.saved: list[dict] = []
-
-    async def async_load(self):
-        return self.preload
-
-    async def async_save(self, data):
-        self.saved.append(data)
-
-
-def _coordinator(api, data: dict, store: "_FakeStore | None" = None):
+def _coordinator(api, data: dict):
     # Bypass DataUpdateCoordinator.__init__ (needs hass); the fetch loop only uses
     # self.api and self.appliance_coordinator.data.
     coord = ConnectLifeStatisticsCoordinator.__new__(ConnectLifeStatisticsCoordinator)
     coord.api = api  # type: ignore[assignment]
     coord.appliance_coordinator = SimpleNamespace(data=data)  # type: ignore[assignment]
-    coord._accepted = {}  # type: ignore[attr-defined]
-    coord._accepted_dirty = False  # type: ignore[attr-defined]
     coord.cycle_totals = {}
-    coord._store = store if store is not None else _FakeStore()  # type: ignore[assignment]
     return coord
 
 
@@ -239,271 +207,41 @@ async def test_coordinator_skips_device_without_statistics_source():
     assert api.consumption_calls == 0
 
 
-# -- issue #669: suppress cloud replay of a completed cycle -----------------
-#
-# ConnectLife's statistics endpoints have been observed to replay a completed
-# cycle's totals into "today" on an hourly cadence while the appliance sits
-# idle. Since the client does no local accumulation, this would otherwise
-# surface directly as a jump in the daily sensor. The coordinator mitigates
-# this by only accepting a freshly fetched result when the day has rolled
-# over or the appliance's status_list has changed since the last accepted
-# reading (a proxy for "something actually happened").
-
-
-def _consumption_result(today_kwh: str) -> EnergyResult:
-    return cast(
-        EnergyResult, SimpleNamespace(electric_curve={_today_key(): today_kwh}, water_curve={})
+async def test_cloud_results_are_passed_through_unfiltered():
+    # Devices on the cloud endpoint get every fetched result as-is: nothing is suppressed
+    # or held back based on the appliance's status, and a lower value is not rejected.
+    api = _FakeApi(
+        consumption=SimpleNamespace(electric_curve={_today_key(): "5.0"}, water_curve={})
     )
-
-
-# The sensor defs _accept_or_reuse needs to check same-day regressions; matches what
-# enabled_sensors("energy_consumption_curve", ...) returns for the _WM dictionary.
-_WM_SENSORS = list(ConsumptionStatisticsSource().sensors)
-
-
-def test_accept_or_reuse_first_reading_is_accepted():
-    coord = _coordinator(_FakeApi(), {})
-    appliance = _appliance("wm", *_WM, status_list={"machine_status": 1})
-    today = dt_util.now().date()
-
-    accepted = coord._accept_or_reuse("wm", appliance, today, _consumption_result("1.0"), _WM_SENSORS)
-
-    assert accepted is not None
-    assert _curve_today(accepted.electric_curve) == 1.0
-
-
-def test_accept_or_reuse_suppresses_replay_when_status_unchanged():
-    coord = _coordinator(_FakeApi(), {})
-    appliance = _appliance("wm", *_WM, status_list={"machine_status": 1})  # idle/standby
-    today = dt_util.now().date()
-
-    first = coord._accept_or_reuse("wm", appliance, today, _consumption_result("26.0"), _WM_SENSORS)
-    # Cloud replays the same completed cycle an hour later; nothing on the
-    # device itself changed.
-    second = coord._accept_or_reuse("wm", appliance, today, _consumption_result("28.0"), _WM_SENSORS)
-
-    assert first is not None
-    assert _curve_today(first.electric_curve) == 26.0
-    assert second is first  # frozen: the replayed 28.0 is not surfaced
-    assert second is not None
-    assert _curve_today(second.electric_curve) == 26.0
-
-
-def test_accept_or_reuse_accepts_when_status_changes():
-    coord = _coordinator(_FakeApi(), {})
-    today = dt_util.now().date()
-    idle = _appliance("wm", *_WM, status_list={"machine_status": 1})
-    running = _appliance("wm", *_WM, status_list={"machine_status": 2})  # a new cycle starts
-
-    coord._accept_or_reuse("wm", idle, today, _consumption_result("26.0"), _WM_SENSORS)
-    accepted = coord._accept_or_reuse("wm", running, today, _consumption_result("28.0"), _WM_SENSORS)
-
-    assert accepted is not None
-    assert _curve_today(accepted.electric_curve) == 28.0
-
-
-def test_accept_or_reuse_accepts_on_new_day_even_if_status_unchanged():
-    coord = _coordinator(_FakeApi(), {})
-    appliance = _appliance("wm", *_WM, status_list={"machine_status": 1})
-    day1 = date(2024, 1, 1)
-    day2 = date(2024, 1, 2)
-
-    coord._accept_or_reuse("wm", appliance, day1, _consumption_result("26.0"), _WM_SENSORS)
-    accepted = coord._accept_or_reuse("wm", appliance, day2, _consumption_result("0.5"), _WM_SENSORS)
-
-    assert accepted is not None
-    assert _curve_today(accepted.electric_curve) == 0.5
-
-
-def test_accept_or_reuse_clears_state_when_fetch_returns_none():
-    coord = _coordinator(_FakeApi(), {})
-    appliance = _appliance("wm", *_WM, status_list={"machine_status": 1})
-    today = dt_util.now().date()
-
-    coord._accept_or_reuse("wm", appliance, today, _consumption_result("26.0"), _WM_SENSORS)
-    result = coord._accept_or_reuse("wm", appliance, today, None, _WM_SENSORS)
-    assert result is None
-
-    # A later successful fetch with unchanged status is treated as a fresh
-    # baseline, not compared against the pre-None accepted value.
-    accepted = coord._accept_or_reuse("wm", appliance, today, _consumption_result("99.0"), _WM_SENSORS)
-    assert accepted is not None
-    assert _curve_today(accepted.electric_curve) == 99.0
-
-
-# -- issue #669 follow-up: same-day regressions are also rejected -----------
-#
-# A drop in the cloud's "today" figure was observed after a status change
-# (running -> finished) — not just a same-value replay. Any status change is
-# enough to make _accept_or_reuse re-trust the cloud, so a same-day decrease
-# needs its own check independent of the status comparison.
-
-
-def test_accept_or_reuse_rejects_same_day_regression_even_with_status_change():
-    coord = _coordinator(_FakeApi(), {})
-    today = dt_util.now().date()
-    running = _appliance("wm", *_WM, status_list={"machine_status": 2})
-    finished = _appliance("wm", *_WM, status_list={"machine_status": 1})
-
-    coord._accept_or_reuse("wm", running, today, _consumption_result("26.31"), _WM_SENSORS)
-    # Status changed (running -> finished), but the cloud reports a lower total
-    # for the same day -- exactly what was observed in issue #669.
-    accepted = coord._accept_or_reuse(
-        "wm", finished, today, _consumption_result("26.13"), _WM_SENSORS
+    appliance = SimpleNamespace(
+        device_id="wm",
+        device_type_code=_WM[0],
+        device_feature_code=_WM[1],
+        puid="pwm",
+        device_nickname="dev-wm",
+        status_list={"machine_status": 1},  # never changes between the two polls
     )
-
-    assert accepted is not None
-    assert _curve_today(accepted.electric_curve) == 26.31  # regression rejected, old value kept
-
-
-def test_accept_or_reuse_accepts_equal_or_higher_value_on_status_change():
-    coord = _coordinator(_FakeApi(), {})
-    today = dt_util.now().date()
-    running = _appliance("wm", *_WM, status_list={"machine_status": 2})
-    finished = _appliance("wm", *_WM, status_list={"machine_status": 1})
-
-    coord._accept_or_reuse("wm", running, today, _consumption_result("26.31"), _WM_SENSORS)
-    accepted = coord._accept_or_reuse(
-        "wm", finished, today, _consumption_result("26.31"), _WM_SENSORS
-    )
-    assert accepted is not None
-    assert _curve_today(accepted.electric_curve) == 26.31  # equal is not a regression
-
-    higher = coord._accept_or_reuse(
-        "wm", running, today, _consumption_result("27.00"), _WM_SENSORS
-    )
-    assert higher is not None
-    assert _curve_today(higher.electric_curve) == 27.00
-
-
-def test_accept_or_reuse_regression_guard_does_not_block_new_day():
-    coord = _coordinator(_FakeApi(), {})
-    appliance = _appliance("wm", *_WM, status_list={"machine_status": 1})
-    day1 = date(2024, 1, 1)
-    day2 = date(2024, 1, 2)
-
-    coord._accept_or_reuse("wm", appliance, day1, _consumption_result("26.31"), _WM_SENSORS)
-    # Lower value, but it's a new day -- this is a legitimate reset, not a regression.
-    accepted = coord._accept_or_reuse(
-        "wm", appliance, day2, _consumption_result("0.10"), _WM_SENSORS
-    )
-
-    assert accepted is not None
-    assert _curve_today(accepted.electric_curve) == 0.10
-
-
-async def test_async_update_data_suppresses_replay_across_polls():
-    api = _FakeApi(consumption=_consumption_result("26.0"))
-    data = {"wm": _appliance("wm", *_WM, status_list={"machine_status": 1})}
-    coord = _coordinator(api, data)
+    coord = _coordinator(api, {"wm": appliance})
 
     first = await coord._async_update_data()
-    api._consumption = _consumption_result("28.0")  # replay, device still idle
+    api._consumption = SimpleNamespace(electric_curve={_today_key(): "7.5"}, water_curve={})
     second = await coord._async_update_data()
+    api._consumption = SimpleNamespace(electric_curve={_today_key(): "2.0"}, water_curve={})
+    third = await coord._async_update_data()
 
-    assert first["wm"] is not None
-    assert _curve_today(first["wm"].electric_curve) == 26.0
-    assert second["wm"] is not None
-    assert _curve_today(second["wm"].electric_curve) == 26.0
-
-
-# -- persistence across restarts --------------------------------------------
-#
-# self._accepted only lives in memory, so a Home Assistant restart would
-# otherwise leave the coordinator with no baseline: the first poll after every
-# restart would blindly accept whatever the cloud currently reports, replay or
-# not. Persisting accepted readings (and restoring them in _async_setup) closes
-# that gap.
-
-
-def _real_consumption_result(today_kwh: str) -> EnergyConsumption:
-    return EnergyConsumption(
-        stat_type="week",
-        date_start="2024-01-01",
-        date_end="2024-01-07",
-        electric_total=None,
-        electric_curve={_today_key(): today_kwh},
-        raw={},
-        water_total=None,
-        run_time=None,
-        cycles=None,
-        norm_electric_total=None,
-        norm_water_total=None,
-        water_curve={},
-        energy_period=None,
-    )
-
-
-def test_status_snapshot_stringifies_values():
-    appliance = _appliance("wm", *_WM, status_list={"machine_status": 1, "door": "closed"})
-    assert _status_snapshot(appliance) == {"machine_status": "1", "door": "closed"}
-
-
-def test_serialize_deserialize_accepted_round_trips():
-    accepted = _AcceptedStatistics(
-        day=date(2024, 1, 1),
-        status_snapshot={"machine_status": "1"},
-        result=_real_consumption_result("26.0"),
-    )
-
-    restored = _deserialize_accepted(_serialize_accepted(accepted))
-
-    assert restored is not None
-    assert restored.day == accepted.day
-    assert restored.status_snapshot == accepted.status_snapshot
-    assert restored.result == accepted.result
-
-
-def test_deserialize_accepted_discards_malformed_entries():
-    assert _deserialize_accepted({}) is None
-    assert _deserialize_accepted({"result_type": "not_a_real_type"}) is None
-    assert _deserialize_accepted({"day": "not-a-date", "result_type": "EnergyConsumption"}) is None
-
-
-async def test_async_setup_restores_accepted_state_and_suppresses_replay():
-    accepted = _AcceptedStatistics(
-        day=dt_util.now().date(),
-        status_snapshot=_status_snapshot(_appliance("wm", *_WM, status_list={"machine_status": 1})),
-        result=_real_consumption_result("26.0"),
-    )
-    store = _FakeStore(preload={"devices": {"wm": _serialize_accepted(accepted)}})
-    api = _FakeApi(consumption=_real_consumption_result("28.0"))  # replay, on the "first" poll
-    data = {"wm": _appliance("wm", *_WM, status_list={"machine_status": 1})}
-    coord = _coordinator(api, data, store=store)
-
-    await coord._async_setup()
-    result = await coord._async_update_data()
-
-    # Restored baseline means even the very first poll this run suppresses the replay.
-    assert result["wm"] is not None
-    assert _curve_today(result["wm"].electric_curve) == 26.0
-
-
-async def test_async_update_data_persists_only_when_accepted_state_changes():
-    store = _FakeStore()
-    api = _FakeApi(consumption=_real_consumption_result("26.0"))
-    data = {"wm": _appliance("wm", *_WM, status_list={"machine_status": 1})}
-    coord = _coordinator(api, data, store=store)
-
-    await coord._async_update_data()  # first reading: new baseline -> persists
-    assert len(store.saved) == 1
-
-    await coord._async_update_data()  # same status, replayed value -> suppressed, no I/O
-    assert len(store.saved) == 1
-
-    data["wm"] = _appliance("wm", *_WM, status_list={"machine_status": 2})  # real change
-    await coord._async_update_data()
-    assert len(store.saved) == 2
+    assert _curve_today(first["wm"].electric_curve) == 5.0
+    assert _curve_today(second["wm"].electric_curve) == 7.5
+    assert _curve_today(third["wm"].electric_curve) == 2.0
 
 
 # -- sensor ----------------------------------------------------------------
 
 
 class _FakeStatsCoordinator:
-    def __init__(self, data, last_update_success=True, cycle_totals=None):
+    def __init__(self, data, last_update_success=True):
         self.data = data
         self.last_update_success = last_update_success
-        self.cycle_totals = cycle_totals if cycle_totals is not None else {}
+        self.cycle_totals = {}
 
 
 def _energy_sensor_def():

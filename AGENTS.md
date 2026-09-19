@@ -96,7 +96,7 @@ one and powers the daily energy/water consumption sensors. These are **not** der
   cycle's own counters once to a per-day total (`DailyCycleTotals`, persisted in the same `Store`),
   and skips the cloud fetch for that device. `StatisticsSensorDef.cycle_value` makes the existing
   daily sensors read those totals (same entity IDs); devices without the block or the properties
-  keep the guarded cloud path. A cycle counts for the local day it finishes.
+  read the cloud endpoint unchanged. A cycle counts for the local day it finishes.
 - **Sensors** (`ConnectLifeStatisticsSensor` in `sensor.py`): generic, configured from a
   `StatisticsSensorDef`; unique ID `{device_id}-{sensor.key}`. Unlike status entities they are
   **not** gated on offline state — cloud-side statistics remain available while the device is offline.

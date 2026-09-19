@@ -1,14 +1,11 @@
 import async_timeout
 import logging
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass
-from datetime import date, timedelta
+from datetime import timedelta
 from typing import Any
 
 from connectlife.api import (
-    AirDuctEnergy,
     ConnectLifeApi,
-    EnergyConsumption,
     EnergyResult,
     LifeConnectAuthError,
     LifeConnectError,
@@ -28,17 +25,12 @@ from .const import DATA_STATE_CLASS_MIGRATION_DONE, DOMAIN
 from .cycle_totals import DailyCycleTotals, cycle_reading
 from .dictionaries import Dictionaries
 from .messages import format_retry_message
-from .statistics_sources import STATISTICS_SOURCES, StatisticsSensorDef, enabled_sensors
+from .statistics_sources import STATISTICS_SOURCES, enabled_sensors
 
 MAX_RETRIES = 3
 STATISTICS_UPDATE_INTERVAL = timedelta(minutes=10)
-STATISTICS_ACCEPTED_STORAGE_VERSION = 1
+STATISTICS_STORAGE_VERSION = 1
 CYCLE_TOTALS_SAVE_DELAY = 5  # seconds; coalesces bursts of changes into one write
-
-# EnergyResult subclasses, keyed by class name, for restoring persisted statistics.
-_ENERGY_RESULT_TYPES: dict[str, type[EnergyResult]] = {
-    cls.__name__: cls for cls in (AirDuctEnergy, EnergyConsumption)
-}
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -229,42 +221,16 @@ class ConnectLifeCoordinator(DataUpdateCoordinator[dict[str, ConnectLifeApplianc
         )
 
 
-@dataclass
-class _AcceptedStatistics:
-    """The last statistics result we chose to expose for a device, and the
-    conditions under which it was accepted."""
-
-    day: date
-    status_snapshot: dict[str, Any]
-    result: EnergyResult
-
-
 class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyResult | None]]):
     """ConnectLife statistics coordinator. Polls each appliance's statistics endpoint
     (selected per device type via the data dictionary ``statistics_source``) every 10
     minutes. Stores the fetched result per device; sensors extract their datapoint.
 
-    ConnectLife's cloud statistics endpoints are known to occasionally replay a
-    completed cycle's totals into "today" on an hourly cadence, even while the
-    appliance sits idle (see
-    https://github.com/oyvindwe/connectlife-ha/issues/669). Since the client performs
-    no local accumulation, such a replay would otherwise show up directly as a jump
-    in the daily sensor. To mitigate this without a way to tell a genuine reading
-    from a replayed one, a freshly fetched result is only accepted when either the
-    local day has rolled over, or the appliance's own status has changed since the
-    last accepted reading — a proxy for "something actually happened". Otherwise the
-    previously accepted result keeps being served. Legitimate ongoing activity (a
-    running cycle) continuously changes status properties (phase, remaining time,
-    etc.), so this should not suppress real increases.
-
-    The accepted-reading state is persisted (see ``_async_setup``/``_async_save_accepted``)
-    so a Home Assistant restart doesn't lose it — otherwise the first poll after every
-    restart would have no baseline to compare against and would blindly accept whatever
-    the cloud happens to be reporting at that moment, replay-inflated or not.
-
     Appliances whose data dictionary opts in via ``statistics.cycle_totals`` skip the cloud
     endpoint entirely: their daily totals are summed client-side from each finished cycle's
-    own telemetry (see :mod:`.cycle_totals`), observed on every main-coordinator refresh.
+    own telemetry (see :mod:`.cycle_totals`), observed on every main-coordinator refresh,
+    because the cloud endpoint re-credits completed cycles (see
+    https://github.com/oyvindwe/connectlife-ha/issues/669).
     """
 
     def __init__(
@@ -277,11 +243,11 @@ class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyRes
         """Initialize statistics coordinator."""
         self.api = api
         self.appliance_coordinator = appliance_coordinator
-        self._accepted: dict[str, _AcceptedStatistics] = {}
-        self._accepted_dirty = False
         self.cycle_totals: dict[str, DailyCycleTotals] = {}
+        # The storage key is unchanged from earlier versions so persisted cycle totals
+        # survive an upgrade.
         self._store: Store[dict[str, Any]] = Store(
-            hass, STATISTICS_ACCEPTED_STORAGE_VERSION, f"{DOMAIN}_{entry_id}_statistics_accepted"
+            hass, STATISTICS_STORAGE_VERSION, f"{DOMAIN}_{entry_id}_statistics_accepted"
         )
         super().__init__(
             hass,
@@ -291,17 +257,13 @@ class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyRes
         )
 
     async def _async_setup(self) -> None:
-        """Restore persisted state from a previous run, then take the first cycle reading."""
+        """Restore persisted cycle totals from a previous run, then take the first reading."""
         try:
             stored = await self._store.async_load()
         except Exception:
             _LOGGER.debug("Failed to load persisted statistics state", exc_info=True)
             stored = None
         if stored:
-            for device_id, entry in stored.get("devices", {}).items():
-                accepted = _deserialize_accepted(entry)
-                if accepted is not None:
-                    self._accepted[device_id] = accepted
             for device_id, entry in stored.get("cycle_totals", {}).items():
                 totals = DailyCycleTotals.from_dict(entry)
                 if totals is not None:
@@ -310,29 +272,11 @@ class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyRes
 
     def _state_payload(self) -> dict[str, Any]:
         """Everything worth persisting across restarts."""
-        devices: dict[str, Any] = {}
-        for device_id, accepted in self._accepted.items():
-            try:
-                devices[device_id] = _serialize_accepted(accepted)
-            except TypeError:
-                # accepted.result wasn't a plain dataclass instance; skip persisting
-                # this one device rather than losing the whole save.
-                _LOGGER.debug(
-                    "Could not serialize statistics state for %s", device_id, exc_info=True
-                )
         return {
-            "devices": devices,
             "cycle_totals": {
                 device_id: totals.to_dict() for device_id, totals in self.cycle_totals.items()
             },
         }
-
-    async def _async_save_accepted(self) -> None:
-        """Persist the current state."""
-        try:
-            await self._store.async_save(self._state_payload())
-        except Exception:
-            _LOGGER.debug("Failed to persist statistics state", exc_info=True)
 
     @callback
     def async_start_cycle_tracking(self) -> Callable[[], None]:
@@ -376,18 +320,18 @@ class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyRes
     async def _async_update_data(self) -> dict[str, EnergyResult | None]:
         """Fetch statistics for appliances whose data dictionary opts into an endpoint."""
         result: dict[str, EnergyResult | None] = {}
-        today = dt_util.now().date()
         for device_id, appliance in self.appliance_coordinator.data.items():
             dictionary = Dictionaries.get_dictionary(appliance)
             source = STATISTICS_SOURCES.get(dictionary.statistics_source or "")
-            sensors = enabled_sensors(dictionary.statistics_source, dictionary.statistics_sensors)
-            if source is None or not sensors:
+            if source is None or not enabled_sensors(
+                dictionary.statistics_source, dictionary.statistics_sensors
+            ):
                 continue
             if device_id in self.cycle_totals:
                 # Daily totals come from the appliance's own cycle telemetry instead.
                 continue
             try:
-                fetched = await source.fetch(self.api, appliance)
+                result[device_id] = await source.fetch(self.api, appliance)
             except LifeConnectAuthError:
                 # Token is rejected; stop rather than hammering the gateway (and any
                 # re-login) for every remaining device. Recovers on the next cycle.
@@ -400,99 +344,4 @@ class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyRes
                     exc_info=True,
                 )
                 result[device_id] = None
-                if self._accepted.pop(device_id, None) is not None:
-                    self._accepted_dirty = True
-                continue
-            result[device_id] = self._accept_or_reuse(device_id, appliance, today, fetched, sensors)
-        if self._accepted_dirty:
-            await self._async_save_accepted()
-            self._accepted_dirty = False
         return result
-
-    def _accept_or_reuse(
-        self,
-        device_id: str,
-        appliance: ConnectLifeAppliance,
-        today: date,
-        fetched: EnergyResult | None,
-        sensors: list[StatisticsSensorDef],
-    ) -> EnergyResult | None:
-        """Decide whether to accept a freshly fetched result or keep serving the last one."""
-        if fetched is None:
-            if self._accepted.pop(device_id, None) is not None:
-                self._accepted_dirty = True
-            return None
-
-        status_snapshot = _status_snapshot(appliance)
-        accepted = self._accepted.get(device_id)
-        if accepted is not None and accepted.day == today:
-            if accepted.status_snapshot == status_snapshot:
-                _LOGGER.debug(
-                    "Suppressing statistics update for %s: no device status change since last "
-                    "accepted reading (see issue #669)",
-                    appliance.device_nickname,
-                )
-                return accepted.result
-
-            if _is_regression(sensors, accepted.result, fetched):
-                _LOGGER.debug(
-                    "Suppressing statistics update for %s: freshly fetched reading is lower "
-                    "than the already-accepted value for today, which the cloud endpoint "
-                    "should never report (see issue #669)",
-                    appliance.device_nickname,
-                )
-                return accepted.result
-
-        self._accepted[device_id] = _AcceptedStatistics(today, status_snapshot, fetched)
-        self._accepted_dirty = True
-        return fetched
-
-
-def _status_snapshot(appliance: ConnectLifeAppliance) -> dict[str, str]:
-    """A plain-string snapshot of an appliance's status, for equality comparison.
-
-    Stringifying keeps this both a valid equality-comparable snapshot and directly
-    JSON-serializable (``status_list`` values may be ``datetime``), so the same
-    representation is used for live comparisons and for persisted state.
-    """
-    return {k: str(v) for k, v in appliance.status_list.items()}
-
-
-def _is_regression(
-    sensors: list[StatisticsSensorDef], previous: EnergyResult, fetched: EnergyResult
-) -> bool:
-    """Whether any sensor's value went down in ``fetched`` versus ``previous``.
-
-    A same-day "daily total" should never decrease. The cloud endpoint has been
-    observed doing so anyway (see issue #669); this rejects such a reading even
-    when the appliance's own status did change, since a status change alone
-    doesn't make an otherwise-implausible cloud value trustworthy.
-    """
-    for sensor in sensors:
-        old_value = sensor.value(previous)
-        new_value = sensor.value(fetched)
-        if old_value is not None and new_value is not None and new_value < old_value:
-            return True
-    return False
-
-
-def _serialize_accepted(accepted: _AcceptedStatistics) -> dict[str, Any]:
-    return {
-        "day": accepted.day.isoformat(),
-        "status_snapshot": accepted.status_snapshot,
-        "result_type": type(accepted.result).__name__,
-        "result": asdict(accepted.result),
-    }
-
-
-def _deserialize_accepted(entry: dict[str, Any]) -> _AcceptedStatistics | None:
-    try:
-        result_cls = _ENERGY_RESULT_TYPES[entry["result_type"]]
-        return _AcceptedStatistics(
-            day=date.fromisoformat(entry["day"]),
-            status_snapshot=entry["status_snapshot"],
-            result=result_cls(**entry["result"]),
-        )
-    except (KeyError, TypeError, ValueError):
-        _LOGGER.debug("Discarding malformed persisted statistics entry", exc_info=True)
-        return None

@@ -339,8 +339,6 @@ def _coordinator(data: dict, store: _FakeStore | None = None, api: _FakeApi | No
     coord = ConnectLifeStatisticsCoordinator.__new__(ConnectLifeStatisticsCoordinator)
     coord.api = api or _FakeApi()  # type: ignore[assignment]
     coord.appliance_coordinator = SimpleNamespace(data=data)  # type: ignore[assignment]
-    coord._accepted = {}  # type: ignore[attr-defined]
-    coord._accepted_dirty = False  # type: ignore[attr-defined]
     coord.cycle_totals = {}
     coord._store = store if store is not None else _FakeStore()  # type: ignore[assignment]
     coord.listener_updates = 0  # type: ignore[attr-defined]
