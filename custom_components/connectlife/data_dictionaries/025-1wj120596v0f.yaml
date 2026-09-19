@@ -1,4 +1,13 @@
 # Uses default mappings
+statistics:
+  source: energy_consumption_curve
+  daily_energy_kwh: true
+  daily_water_consumption: true
+  cycle_totals:
+    phase: Current_program_phase
+    finished: 10
+    energy: Electricit_consumption
+    water: Water_consumption
 properties:
 - property: Selected_program_ID
   select:

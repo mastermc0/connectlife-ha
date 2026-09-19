@@ -150,6 +150,7 @@ def _coordinator(api, data: dict, store: "_FakeStore | None" = None):
     coord.appliance_coordinator = SimpleNamespace(data=data)  # type: ignore[assignment]
     coord._accepted = {}  # type: ignore[attr-defined]
     coord._accepted_dirty = False  # type: ignore[attr-defined]
+    coord.cycle_totals = {}
     coord._store = store if store is not None else _FakeStore()  # type: ignore[assignment]
     return coord
 
@@ -499,9 +500,10 @@ async def test_async_update_data_persists_only_when_accepted_state_changes():
 
 
 class _FakeStatsCoordinator:
-    def __init__(self, data, last_update_success=True):
+    def __init__(self, data, last_update_success=True, cycle_totals=None):
         self.data = data
         self.last_update_success = last_update_success
+        self.cycle_totals = cycle_totals if cycle_totals is not None else {}
 
 
 def _energy_sensor_def():

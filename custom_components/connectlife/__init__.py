@@ -88,6 +88,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass, api, coordinator, entry.entry_id
         )
         await statistics_coordinator.async_config_entry_first_refresh()
+        entry.async_on_unload(statistics_coordinator.async_start_cycle_tracking())
         hass.data[DOMAIN][f"{entry.entry_id}_statistics"] = statistics_coordinator
 
     entry.async_on_unload(entry.add_update_listener(update_listener))

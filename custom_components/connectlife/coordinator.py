@@ -1,6 +1,6 @@
 import async_timeout
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import date, timedelta
 from typing import Any
@@ -17,6 +17,7 @@ from connectlife.appliance import ConnectLifeAppliance
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.statistics import list_statistic_ids
 from homeassistant.const import Platform
+from homeassistant.core import callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import device_registry as dr, entity_registry as er, issue_registry as ir
 from homeassistant.helpers.storage import Store
@@ -24,6 +25,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.util import dt as dt_util
 
 from .const import DATA_STATE_CLASS_MIGRATION_DONE, DOMAIN
+from .cycle_totals import DailyCycleTotals, cycle_reading
 from .dictionaries import Dictionaries
 from .messages import format_retry_message
 from .statistics_sources import STATISTICS_SOURCES, StatisticsSensorDef, enabled_sensors
@@ -31,6 +33,7 @@ from .statistics_sources import STATISTICS_SOURCES, StatisticsSensorDef, enabled
 MAX_RETRIES = 3
 STATISTICS_UPDATE_INTERVAL = timedelta(minutes=10)
 STATISTICS_ACCEPTED_STORAGE_VERSION = 1
+CYCLE_TOTALS_SAVE_DELAY = 5  # seconds; coalesces bursts of changes into one write
 
 # EnergyResult subclasses, keyed by class name, for restoring persisted statistics.
 _ENERGY_RESULT_TYPES: dict[str, type[EnergyResult]] = {
@@ -258,6 +261,10 @@ class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyRes
     so a Home Assistant restart doesn't lose it — otherwise the first poll after every
     restart would have no baseline to compare against and would blindly accept whatever
     the cloud happens to be reporting at that moment, replay-inflated or not.
+
+    Appliances whose data dictionary opts in via ``statistics.cycle_totals`` skip the cloud
+    endpoint entirely: their daily totals are summed client-side from each finished cycle's
+    own telemetry (see :mod:`.cycle_totals`), observed on every main-coordinator refresh.
     """
 
     def __init__(
@@ -272,6 +279,7 @@ class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyRes
         self.appliance_coordinator = appliance_coordinator
         self._accepted: dict[str, _AcceptedStatistics] = {}
         self._accepted_dirty = False
+        self.cycle_totals: dict[str, DailyCycleTotals] = {}
         self._store: Store[dict[str, Any]] = Store(
             hass, STATISTICS_ACCEPTED_STORAGE_VERSION, f"{DOMAIN}_{entry_id}_statistics_accepted"
         )
@@ -283,21 +291,25 @@ class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyRes
         )
 
     async def _async_setup(self) -> None:
-        """Restore accepted statistics readings from a previous run, if any."""
+        """Restore persisted state from a previous run, then take the first cycle reading."""
         try:
             stored = await self._store.async_load()
         except Exception:
             _LOGGER.debug("Failed to load persisted statistics state", exc_info=True)
-            return
-        if not stored:
-            return
-        for device_id, entry in stored.get("devices", {}).items():
-            accepted = _deserialize_accepted(entry)
-            if accepted is not None:
-                self._accepted[device_id] = accepted
+            stored = None
+        if stored:
+            for device_id, entry in stored.get("devices", {}).items():
+                accepted = _deserialize_accepted(entry)
+                if accepted is not None:
+                    self._accepted[device_id] = accepted
+            for device_id, entry in stored.get("cycle_totals", {}).items():
+                totals = DailyCycleTotals.from_dict(entry)
+                if totals is not None:
+                    self.cycle_totals[device_id] = totals
+        self._observe_cycle_totals()
 
-    async def _async_save_accepted(self) -> None:
-        """Persist the current accepted-reading state."""
+    def _state_payload(self) -> dict[str, Any]:
+        """Everything worth persisting across restarts."""
         devices: dict[str, Any] = {}
         for device_id, accepted in self._accepted.items():
             try:
@@ -308,10 +320,58 @@ class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyRes
                 _LOGGER.debug(
                     "Could not serialize statistics state for %s", device_id, exc_info=True
                 )
+        return {
+            "devices": devices,
+            "cycle_totals": {
+                device_id: totals.to_dict() for device_id, totals in self.cycle_totals.items()
+            },
+        }
+
+    async def _async_save_accepted(self) -> None:
+        """Persist the current state."""
         try:
-            await self._store.async_save({"devices": devices})
+            await self._store.async_save(self._state_payload())
         except Exception:
             _LOGGER.debug("Failed to persist statistics state", exc_info=True)
+
+    @callback
+    def async_start_cycle_tracking(self) -> Callable[[], None]:
+        """Observe every main-coordinator refresh (60s) for finished cycles.
+
+        Returns the unsubscribe callback, to be run when the config entry unloads.
+        """
+        return self.appliance_coordinator.async_add_listener(self._observe_cycle_totals)
+
+    @callback
+    def _observe_cycle_totals(self) -> None:
+        """Fold each opted-in appliance's current reading into its daily cycle totals."""
+        today = dt_util.now().date()
+        changed = False
+        for device_id, appliance in self.appliance_coordinator.data.items():
+            reading = cycle_reading(appliance, Dictionaries.get_dictionary(appliance))
+            if reading is None:
+                continue
+            is_finished, energy, water = reading
+            totals = self.cycle_totals.get(device_id)
+            if totals is None:
+                self.cycle_totals[device_id] = DailyCycleTotals.start(
+                    today, is_finished, energy, water
+                )
+                changed = True
+            else:
+                was_banked = totals.banked
+                if totals.observe(today, is_finished, energy, water):
+                    changed = True
+                    if totals.banked and not was_banked:
+                        _LOGGER.debug(
+                            "Banked finished cycle for %s: day total now %.2f kWh, %.2f L",
+                            appliance.device_nickname,
+                            totals.energy_kwh,
+                            totals.water_l,
+                        )
+        if changed:
+            self._store.async_delay_save(self._state_payload, CYCLE_TOTALS_SAVE_DELAY)
+            self.async_update_listeners()
 
     async def _async_update_data(self) -> dict[str, EnergyResult | None]:
         """Fetch statistics for appliances whose data dictionary opts into an endpoint."""
@@ -322,6 +382,9 @@ class ConnectLifeStatisticsCoordinator(DataUpdateCoordinator[dict[str, EnergyRes
             source = STATISTICS_SOURCES.get(dictionary.statistics_source or "")
             sensors = enabled_sensors(dictionary.statistics_source, dictionary.statistics_sensors)
             if source is None or not sensors:
+                continue
+            if device_id in self.cycle_totals:
+                # Daily totals come from the appliance's own cycle telemetry instead.
                 continue
             try:
                 fetched = await source.fetch(self.api, appliance)
